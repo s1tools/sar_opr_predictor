@@ -1,0 +1,22 @@
+{
+    "Dir": "models",
+    "iw": {
+	"w1": {
+	    "h5": "s1c-iw_opr_w1_model-g20260624.h5",
+	    "normalization": "s1c-iw_opr_w1_normalization-g20260624.npy"
+	},
+	"w2": {
+	    "h5": "s1c-iw_opr_w2_model-g20260624.h5",
+	    "normalization": "s1c-iw_opr_w2_normalization-g20260624.npy"
+	},
+	"w3": {
+	    "h5": "s1c-iw_opr_w3_model-g20260624.h5",
+	    "normalization": "s1c-iw_opr_w3_normalization-g20260624.npy"
+	},
+	"w4": {
+	    "h5": "s1c-iw_opr_w4_model-g20260624.h5",
+	    "normalization": "s1c-iw_opr_w4_normalization-g20260624.npy"
+	}
+    }
+}
+
