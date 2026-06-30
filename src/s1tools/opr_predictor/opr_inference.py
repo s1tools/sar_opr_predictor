@@ -377,6 +377,9 @@ class OPRInference:
         valid_indices = np.flatnonzero(are_patches_valid)
         n_patches = len(self.coordinates)
 
+        if valid_indices.size == 0:
+            return np.full(self.shape, np.nan)
+
         outputs = model.predict(
             (image_input[valid_indices], scalar_input[valid_indices]),
             batch_size=batch_size,
