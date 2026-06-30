@@ -48,6 +48,8 @@ class OPRConfig:
     nesz_clip: float = 50.0
     target_resolution_m: int = 200
     output_resolution_m: int = 1000
+    minimum_incidence_angle: float = 29.1
+
     regression_floor_mm_per_hour: float = 0.5
     h5_filename: str = "G.h5"
     normalization_filename: str = "normalization.npy"
@@ -361,9 +363,31 @@ class OPRInference:
             self.pad_x, self.pad_y, pad=self.pad, patch_size=self.patch_size,
         )
 
-    def run_model(self, model: tf.keras.models.Model, batch_size: int = CONFIG.patch_size) -> np.ndarray:
-        batch = self.get_normalized_batch(model.normalization)
-        mosaics = model.predict(batch, batch_size=batch_size)
+    def run_model(
+            self, 
+            model: tf.keras.models.Model, 
+            batch_size: int = CONFIG.patch_size
+        ) -> np.ndarray:
+        image_input, scalar_input = self.get_normalized_batch(model.normalization)
+
+        are_patches_valid: typing.List[bool] = [
+            self.mask[coordinate].mean() > 0.5
+            for coordinate in self.coordinates
+        ]
+        valid_indices = np.flatnonzero(are_patches_valid)
+        n_patches = len(self.coordinates)
+
+        outputs = model.predict(
+            (image_input[valid_indices], scalar_input[valid_indices]),
+            batch_size=batch_size,
+        )
+
+        mosaics = []
+        for output in outputs:
+            full = np.zeros((n_patches, *output.shape[1:]), dtype=output.dtype)
+            full[valid_indices] = output
+            mosaics.append(full)
+
         predictions = self.unpack_mosaic_prediction(mosaics)
         regression = predictions[1]
         thresholded = np.where(regression >= CONFIG.regression_floor_mm_per_hour, regression, 0.0)
