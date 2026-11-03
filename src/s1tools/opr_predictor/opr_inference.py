@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
+from scipy import ndimage
 from tensorflow.keras import backend as K
 
 
@@ -49,8 +50,8 @@ class OPRConfig:
     target_resolution_m: int = 200
     output_resolution_m: int = 1000
     minimum_incidence_angle: float = 29.1
+    minimum_valid_tile_fraction: float = 0.25
 
-    regression_floor_mm_per_hour: float = 0.5
     h5_filename: str = "G.h5"
     normalization_filename: str = "normalization.npy"
     model_keys: typing.Tuple[str, ...] = DEFAULT_MODEL_KEYS
@@ -181,23 +182,86 @@ def get_slice_generator(
     shape: typing.Tuple[int, ...],
     patch_size: int = CONFIG.patch_size,
 ) -> typing.Generator[typing.Tuple[slice, slice], None, None]:
-    stride = patch_size // 4
-    for x1 in range(0, shape[0] - patch_size, stride):
+    stride = patch_size // 2
+    for x1 in range(0, shape[0] - patch_size + 1, stride):
         x2 = x1 + patch_size
-        for y1 in range(0, shape[1] - patch_size, stride):
+        for y1 in range(0, shape[1] - patch_size + 1, stride):
             y2 = y1 + patch_size
             yield np.s_[x1:x2, y1:y2]
 
 
-def get_inputs(
-    arrays: typing.Tuple[np.ndarray, ...],
+def fold(index: np.ndarray, low: np.ndarray, high: np.ndarray) -> np.ndarray:
+    """Mirror ``index`` into ``[low, high]`` with the semantics of ``np.pad(mode="reflect")``."""
+    length = high - low
+    half_period = np.maximum(length, 1)
+    t = (index - low) % (2 * half_period)
+    folded = low + np.where(t < half_period, t, 2 * half_period - t)
+    return np.where(length == 0, low, folded)
+
+
+def line_limits(footprint: np.ndarray, axis: int) -> typing.Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    has_footprint = footprint.any(axis=axis)
+    first = footprint.argmax(axis=axis)
+    last = footprint.shape[axis] - 1 - np.flip(footprint, axis=axis).argmax(axis=axis)
+    return has_footprint, first, last
+
+
+def place_in_padded_frame(array: np.ndarray, pad_x: int, pad_y: int, pad: int = 0) -> np.ndarray:
+    pad_width = ((pad, pad_x), (pad, pad_y)) + ((0, 0),) * (array.ndim - 2)
+    return np.pad(array, pad_width, mode="constant", constant_values=0)
+
+
+def footprint_reflection_indices(
+    footprint: np.ndarray,
     pad_x: int,
     pad_y: int,
     pad: int = 0,
+) -> typing.Tuple[np.ndarray, np.ndarray]:
+    """Source (row, column) in the unpadded scene of every pixel of the padded frame.
+
+    Pixels inside the footprint map to themselves. Every other pixel is first mirrored about the
+    footprint's bounding box (``np.pad(mode="reflect")`` of the box). Where that mirror falls outside
+    the footprint, it is then mirrored about the first/last footprint index of its row (range pass)
+    or of its column (azimuth pass), whichever is nearer. Where that line mirror is more than twice as
+    far as the nearest footprint pixel (notch between two staircases), or still falls outside the
+    footprint (hole inside a line), the pixel is point-reflected through that nearest pixel instead.
+    """
+    padded = place_in_padded_frame(footprint.astype(bool), pad_x, pad_y, pad)
+    rows, cols = np.indices(padded.shape)
+    if not padded.any():
+        return np.clip(rows - pad, 0, footprint.shape[0] - 1), np.clip(cols - pad, 0, footprint.shape[1] - 1)
+    rows_ok, first_col, last_col = line_limits(padded, 1)
+    cols_ok, first_row, last_row = line_limits(padded, 0)
+    r0, r1 = np.flatnonzero(rows_ok)[[0, -1]]
+    c0, c1 = np.flatnonzero(cols_ok)[[0, -1]]
+    rows = fold(rows, r0, r1)
+    cols = fold(cols, c0, c1)
+    inside = padded[rows, cols]
+    range_cols = fold(cols, first_col[rows], last_col[rows])
+    range_distance = np.minimum(np.abs(cols - first_col[rows]), np.abs(cols - last_col[rows]))
+    azimuth_rows = fold(rows, first_row[cols], last_row[cols])
+    azimuth_distance = np.minimum(np.abs(rows - first_row[cols]), np.abs(rows - last_row[cols]))
+    use_range = ~inside & rows_ok[rows] & (~cols_ok[cols] | (range_distance <= azimuth_distance))
+    use_azimuth = ~inside & cols_ok[cols] & ~use_range
+    source_rows = np.where(use_azimuth, azimuth_rows, rows)
+    source_cols = np.where(use_range, range_cols, cols)
+    distance, (near_rows, near_cols) = ndimage.distance_transform_edt(~padded, return_indices=True)
+    line_distance = np.where(use_range, range_distance, np.where(use_azimuth, azimuth_distance, np.inf))
+    notch = ~inside & ((line_distance > 2 * distance[rows, cols]) | ~padded[source_rows, source_cols])
+    mirror_rows = np.clip(2 * near_rows[rows, cols] - rows, 0, padded.shape[0] - 1)
+    mirror_cols = np.clip(2 * near_cols[rows, cols] - cols, 0, padded.shape[1] - 1)
+    mirror_rows, mirror_cols = near_rows[mirror_rows, mirror_cols], near_cols[mirror_rows, mirror_cols]
+    source_rows = np.where(notch, mirror_rows, source_rows)
+    source_cols = np.where(notch, mirror_cols, source_cols)
+    return source_rows - pad, source_cols - pad
+
+
+def get_inputs(
+    arrays: typing.Tuple[np.ndarray, ...],
+    reflection_indices: typing.Tuple[np.ndarray, np.ndarray],
 ) -> np.ndarray:
     inputs: np.ndarray = np.stack(arrays, axis=-1)
-    pad_width = ((pad, pad_x), (pad, pad_y), (0, 0))
-    return np.pad(inputs, pad_width, mode="reflect")
+    return inputs[reflection_indices]
 
 
 def concatenation_to_patches(
@@ -222,17 +286,38 @@ def content_to_patches(
     crosspol_nesz: np.ndarray,
     incidence_angle: np.ndarray,
     ecmwf_wind_speed: np.ndarray,
-    pad_x: int,
-    pad_y: int,
-    pad: int = 0,
+    reflection_indices: typing.Tuple[np.ndarray, np.ndarray],
     patch_size: int = CONFIG.patch_size,
 ) -> typing.Tuple[np.ndarray, np.ndarray, typing.Tuple[typing.Tuple[slice, slice], ...], typing.Tuple[int, ...]]:
-    image_inputs = get_inputs((copol_ssr, crosspol_ssr, mask * 0), pad_x, pad_y, pad)
-    scalar_inputs = get_inputs((crosspol_nesz, incidence_angle, ecmwf_wind_speed), pad_x, pad_y, pad)
+    image_inputs = get_inputs((copol_ssr, crosspol_ssr, mask * 0), reflection_indices)
+    scalar_inputs = get_inputs((crosspol_nesz, incidence_angle, ecmwf_wind_speed), reflection_indices)
     batch_image, batch_scalar, coordinates = concatenation_to_patches(
         image_inputs, scalar_inputs, patch_size=patch_size,
     )
     return batch_image, batch_scalar, coordinates, image_inputs.shape
+
+
+def tile_weights(patch_size: int = CONFIG.patch_size) -> np.ndarray:
+    profile = 1 - np.abs(np.arange(patch_size) - (patch_size - 1) / 2) / (patch_size / 2)
+    return np.outer(profile, profile)
+
+
+def weighted_mosaic(
+    tiles: np.ndarray,
+    coordinates: typing.Sequence[typing.Tuple[slice, slice]],
+    shape: typing.Tuple[int, ...],
+    patch_size: int = CONFIG.patch_size,
+) -> np.ndarray:
+    weights = tile_weights(patch_size)
+    numerator = np.zeros(shape[:2])
+    denominator = np.zeros(shape[:2])
+    for slices, tile in zip(coordinates, tiles):
+        numerator[slices] += weights * tile
+        denominator[slices] += weights
+    field = np.full(shape[:2], np.nan)
+    covered = denominator > 0
+    field[covered] = numerator[covered] / denominator[covered]
+    return field
 
 
 def unpack_mosaic_prediction(
@@ -245,13 +330,9 @@ def unpack_mosaic_prediction(
     patch_size: int = CONFIG.patch_size,
 ) -> typing.Tuple[np.ndarray, ...]:
     predictions: typing.List[np.ndarray] = []
-    center_slice = np.s_[patch_size // 4:-patch_size // 4, patch_size // 4:-patch_size // 4]
     for mosaic in mosaics[:2]:
-        prediction = np.full(shape[:2], np.nan)
-        for (x_slice, y_slice), tile in zip(coordinates, mosaic):
-            prediction[x_slice, y_slice][center_slice] = tile[center_slice][:, :, 0]
-        prediction = prediction[pad:-pad_x, pad:-pad_y]
-        predictions.append(prediction)
+        field = weighted_mosaic(mosaic[:, :, :, 0], coordinates, shape, patch_size)
+        predictions.append(field[pad:shape[0] - pad_x, pad:shape[1] - pad_y])
     return tuple(predictions)
 
 
@@ -278,6 +359,7 @@ class OPRInference:
     ecmwf_wind_speed: np.ndarray
     incidence: np.ndarray
     invalidity_mask: np.ndarray
+    footprint: np.ndarray
     models: typing.Tuple[tf.keras.models.Model, ...]
 
     patch_size: int = CONFIG.patch_size
@@ -302,32 +384,46 @@ class OPRInference:
         return np.round(np.minimum(self.vh_nesz_in, clip_value) * (2 ** 16 - 1) / clip_value)
 
     @LazyProperty
+    def finite_footprint(self) -> np.ndarray:
+        """Footprint pixels where every array fed to the models is finite."""
+        model_inputs = (self.vv_ssr, self.vh_ssr, self.vh_nesz_out, self.incidence, self.ecmwf_wind_speed)
+        return np.logical_and.reduce((self.footprint.astype(bool),) + tuple(np.isfinite(a) for a in model_inputs))
+
+    @LazyProperty
     def mask(self) -> np.ndarray:
-        return np.logical_and.reduce((self.vv_ssr > 0, self.invalidity_mask == 0))
+        return np.logical_and(self.finite_footprint, self.invalidity_mask == 0)
 
     @LazyProperty
     def pad(self) -> int:
-        return self.patch_size // 4
+        return self.patch_size // 2
+
+    @LazyProperty
+    def padded_mask(self) -> np.ndarray:
+        return place_in_padded_frame(self.mask, self.pad_x, self.pad_y, self.pad)
+
+    @LazyProperty
+    def reflection_indices(self) -> typing.Tuple[np.ndarray, np.ndarray]:
+        return footprint_reflection_indices(self.finite_footprint, self.pad_x, self.pad_y, self.pad)
+
+    def _pad_end(self, size: int) -> int:
+        stride = self.patch_size // 2
+        extent = max(self.patch_size, 2 * self.pad + size)
+        n_tiles = -(-(extent - self.patch_size) // stride)
+        return self.patch_size + n_tiles * stride - self.pad - size
 
     @LazyProperty
     def pad_x(self) -> int:
-        pad_x = self.patch_size - (self.shape[0] + self.pad) % self.patch_size
-        if pad_x < self.pad:
-            pad_x += self.patch_size
-        return pad_x
+        return self._pad_end(self.shape[0])
 
     @LazyProperty
     def pad_y(self) -> int:
-        pad_y = self.patch_size - (self.shape[1] + self.pad) % self.patch_size
-        if pad_y < self.pad:
-            pad_y += self.patch_size
-        return pad_y
+        return self._pad_end(self.shape[1])
 
     def set_patches(self) -> None:
         batch_image, batch_scalar, coordinates, padded_shape = content_to_patches(
             self.vv_ssr, self.vh_ssr, self.mask * 0,
             self.vh_nesz_out, self.incidence, self.ecmwf_wind_speed,
-            self.pad_x, self.pad_y, self.pad, patch_size=self.patch_size,
+            self.reflection_indices, patch_size=self.patch_size,
         )
         self.__dict__["_lazy_batch_image"] = batch_image
         self.__dict__["_lazy_batch_scalar"] = batch_scalar
@@ -357,9 +453,13 @@ class OPRInference:
     def get_normalized_batch(self, normalization: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray]:
         return normalize(normalization, self.batch_image, self.batch_scalar)
 
-    def unpack_mosaic_prediction(self, mosaics: typing.Tuple[np.ndarray, ...]) -> typing.Tuple[np.ndarray, ...]:
+    def unpack_mosaic_prediction(
+        self,
+        mosaics: typing.Tuple[np.ndarray, ...],
+        coordinates: typing.Sequence[typing.Tuple[slice, slice]],
+    ) -> typing.Tuple[np.ndarray, ...]:
         return unpack_mosaic_prediction(
-            mosaics, self.padded_shape, self.coordinates,
+            mosaics, self.padded_shape, coordinates,
             self.pad_x, self.pad_y, pad=self.pad, patch_size=self.patch_size,
         )
 
@@ -371,11 +471,10 @@ class OPRInference:
         image_input, scalar_input = self.get_normalized_batch(model.normalization)
 
         are_patches_valid: typing.List[bool] = [
-            self.mask[coordinate].mean() > 0.5
+            self.padded_mask[coordinate].mean() > CONFIG.minimum_valid_tile_fraction
             for coordinate in self.coordinates
         ]
         valid_indices = np.flatnonzero(are_patches_valid)
-        n_patches = len(self.coordinates)
 
         if valid_indices.size == 0:
             return np.full(self.shape, np.nan)
@@ -385,23 +484,18 @@ class OPRInference:
             batch_size=batch_size,
         )
 
-        mosaics = []
-        for output in outputs:
-            full = np.zeros((n_patches, *output.shape[1:]), dtype=output.dtype)
-            full[valid_indices] = output
-            mosaics.append(full)
-
-        predictions = self.unpack_mosaic_prediction(mosaics)
+        evaluated = tuple(self.coordinates[index] for index in valid_indices)
+        predictions = self.unpack_mosaic_prediction(outputs, evaluated)
         regression = predictions[1]
-        thresholded = np.where(regression >= CONFIG.regression_floor_mm_per_hour, regression, 0.0)
-        return np.where(self.mask > 0.5, thresholded, np.nan)
+        return np.where(self.mask > 0.5, regression, np.nan)
 
     def rain_rate_ensemble(self, batch_size: int = CONFIG.patch_size) -> typing.Tuple[np.ndarray, np.ndarray]:
         stacked = np.stack([self.run_model(model, batch_size) for model in self.models], axis=0)
         mean = np.nanmean(stacked, axis=0)
         std = np.nanstd(stacked, axis=0)
         with np.errstate(divide="ignore", invalid="ignore"):
-            relative_std = np.where(mean > 0, std / mean, np.nan)
+            relative_std = np.where(np.isfinite(mean) & (mean != 0), std / np.abs(mean), np.nan)
+        relative_std = np.where((mean == 0) & (std == 0), 0.0, relative_std)
         return mean, relative_std
 
 
